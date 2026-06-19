@@ -1,0 +1,71 @@
+/node_kamera:
+  ros__parameters:
+    device_utama: ""
+    device_bawah: ""
+    device_samping: ""
+    fps_utama: 30
+    fps_bawah: 10
+    fps_samping: 10
+    frame_width: 640
+    frame_height: 480
+
+/node_deteksi:
+  ros__parameters:
+    model_path: "/home/aji/robot_ws/finallll_detek.onnx"
+    conf_threshold: 0.3
+    mission_conf_threshold: 0.6
+    required_frames: 5
+    horizon_ratio: 0.33
+    inference_interval_ms: 100
+
+/node_lidar:
+  ros__parameters:
+    serial_port: ""
+    baudrate: 115200
+    num_sectors: 4
+    obstacle_distance: 0.5
+    publish_scan: true
+    frame_id: "laser_frame"
+
+/node_navigasi:
+  ros__parameters:
+    waypoint_lat: -7.052546
+    waypoint_lon: 110.434872
+    cruise_speed: 0.4
+    approach_speed: 0.25
+    visual_p_gain: 0.002
+    visual_i_gain: 0.0001
+    visual_d_gain: 0.0005
+    lpf_alpha: 0.3
+    gps_p_gain: 0.05
+    max_yaw_rate: 0.5
+    obstacle_stop_dist: 0.4
+    obstacle_avoid_speed: 0.3
+    fusion_dist_min: 0.3
+    fusion_dist_max: 3.0
+    fusion_speed_min: 0.15
+    fusion_speed_max: 0.6
+
+/node_motor:
+  ros__parameters:
+    serial_port: ""
+    baudrate: 115200
+    protocol: "raw"
+    max_linear: 0.5
+    max_angular: 0.8
+
+/node_misi:
+  ros__parameters:
+    firebase_key_path: "/home/aji/robot_ws/firebase-key.json"
+    firebase_url: ""
+    firebase_ref: ""
+    cloudinary_cloud: ""
+    cloudinary_key: ""
+    cloudinary_secret: ""
+    cloudinary_folder: "asv_lomba"
+    capture_cooldown: 5.0
+
+/sim_bridge:
+  ros__parameters:
+    origin_lat: -7.052600
+    origin_lon: 110.434800

@@ -1,0 +1,26 @@
+/robot_stack/lidar_node:
+  ros__parameters:
+    scan_topic: "/scan"
+    num_sectors: 4
+    obstacle_distance: 0.5
+
+/robot_stack/vision_node:
+  ros__parameters:
+    camera_topic: "/camera/image_raw"
+    model_path: "/home/aji/yolov8n.pt"  # YOLO model (kosongin utk color-based)
+    conf_threshold: 0.5
+
+/robot_stack/autonomous_node:
+  ros__parameters:
+    obstacle_stop_dist: 0.4
+    search_speed: 0.3
+    forward_speed: 0.2
+    turn_speed: 0.4
+
+/robot_stack/motor_node:
+  ros__parameters:
+    serial_port: "/dev/ttyACM0"
+    baudrate: 115200
+    protocol: "mavlink"  # mavlink, msp, raw
+    max_linear: 0.5
+    max_angular: 0.8
