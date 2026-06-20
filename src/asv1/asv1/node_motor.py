@@ -3,7 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, Int32
 import threading
 import time
 import math
@@ -27,6 +27,7 @@ class NodeMotor(Node):
 
         self.mav = None
         self._mavutil = None
+        self._mav_lock = threading.Lock()  # CRITICAL FIX: Thread safety
         self.lat = self.lon = self.heading = self.cog = self.sog = self.battery = 0.0
         self._gps_received = False
         self._target_sys = 1
@@ -38,6 +39,8 @@ class NodeMotor(Node):
         self._reconnecting = False
         self._fc_mode = 0
         self._startup_cycles = 40
+        self._heartbeat_thread = None  # Track thread for cleanup
+        self._read_thread = None       # Track thread for cleanup
 
         self.get_logger().info('=== MOTOR NODE START ===')
         self.get_logger().info(f'Konfigurasi: port={self._port}, baud={self._baud}')
@@ -50,6 +53,7 @@ class NodeMotor(Node):
             self.get_logger().info('Motor disabled (port kosong / bukan mavlink)')
 
         self.pub_telemetri = self.create_publisher(Float32MultiArray, '/asv/telemetri', 10)
+        self.pub_fc_mode = self.create_publisher(Int32, '/asv/fc_mode', 10)  # NEW: FC mode indicator
         self.sub_cmd = self.create_subscription(Twist, '/asv/cmd_vel', self.cb_cmd, 10)
         self.create_timer(1.0, self.publish_telemetry)
         self.create_timer(1.0, self._watchdog)
@@ -86,8 +90,10 @@ class NodeMotor(Node):
                     self.get_logger().info(f'FC heartbeat: sys={msg.get_srcSystem()}, armed={self._armed}, mode={msg.custom_mode}')
                     break
 
-            threading.Thread(target=self._heartbeat_loop, daemon=True).start()
-            threading.Thread(target=self._read_loop, daemon=True).start()
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self._heartbeat_thread.start()
+            self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._read_thread.start()
 
             if self._last_heartbeat > 0:
                 self._setup_auto_control()
@@ -102,23 +108,31 @@ class NodeMotor(Node):
             return False
 
     def _heartbeat_loop(self):
-        while rclpy.ok() and self.mav is not None:
-            try:
-                self.mav.mav.heartbeat_send(
-                    type=18, autopilot=0,
-                    base_mode=64, custom_mode=0,
-                    system_status=4,
-                )
-            except Exception:
-                pass
+        while rclpy.ok():
+            with self._mav_lock:
+                if self.mav is None:
+                    break
+                try:
+                    self.mav.mav.heartbeat_send(
+                        type=18, autopilot=0,
+                        base_mode=64, custom_mode=0,
+                        system_status=4,
+                    )
+                except Exception:
+                    pass
             time.sleep(1)
 
     def _read_loop(self):
-        while rclpy.ok() and self.mav is not None:
+        while rclpy.ok():
             try:
-                msg = self.mav.recv_match(blocking=False, timeout=0.5)
+                with self._mav_lock:
+                    if self.mav is None:
+                        break
+                    msg = self.mav.recv_match(blocking=False, timeout=0.5)
+                
                 if msg is None:
                     continue
+                
                 t = msg.get_type()
                 if t == 'HEARTBEAT':
                     src = msg.get_srcSystem()
@@ -158,8 +172,10 @@ class NodeMotor(Node):
     _log_count = 0
 
     def cb_cmd(self, msg):
-        if self.mav is None:
-            return
+        with self._mav_lock:
+            if self.mav is None:
+                return
+        
         now = time.time()
         if now - self._last_cmd_time < 0.05:
             return
@@ -178,22 +194,30 @@ class NodeMotor(Node):
         thr_pwm = max(1100, min(1900, thr_pwm))
 
         try:
-            # Throttle: S5 (ESC/SERVO5), Rudder: S1+S8 (dual)
-            self.mav.mav.command_long_send(
-                self._target_sys, self._target_comp,
-                self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-                0, 5, thr_pwm, 0, 0, 0, 0, 0
-            )
-            self.mav.mav.command_long_send(
-                self._target_sys, self._target_comp,
-                self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-                0, 1, steer_pwm, 0, 0, 0, 0, 0
-            )
-            self.mav.mav.command_long_send(
-                self._target_sys, self._target_comp,
-                self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-                0, 8, steer_pwm, 0, 0, 0, 0, 0
-            )
+            with self._mav_lock:
+                if self.mav is None:
+                    return
+                # Throttle: S8 (SERVO8 — Motor ESC), Rudder: S5+S2+S1
+                self.mav.mav.command_long_send(
+                    self._target_sys, self._target_comp,
+                    self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                    0, 8, thr_pwm, 0, 0, 0, 0, 0
+                )
+                self.mav.mav.command_long_send(
+                    self._target_sys, self._target_comp,
+                    self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                    0, 5, steer_pwm, 0, 0, 0, 0, 0
+                )
+                self.mav.mav.command_long_send(
+                    self._target_sys, self._target_comp,
+                    self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                    0, 2, steer_pwm, 0, 0, 0, 0, 0
+                )
+                self.mav.mav.command_long_send(
+                    self._target_sys, self._target_comp,
+                    self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                    0, 1, steer_pwm, 0, 0, 0, 0, 0
+                )
         except Exception as e:
             self.get_logger().warn(f'DO_SET_SERVO error: {e}')
 
@@ -203,7 +227,7 @@ class NodeMotor(Node):
         if self._log_count % 50 == 0:
             motor = "NYALA" if abs(thr_pwm - 1500) > 20 else "MATI"
             servo = "KANAN" if steer_pwm > 1520 else ("KIRI" if steer_pwm < 1480 else "LURUS")
-            self.get_logger().info(f'DO_SET_SERVO: S5={thr_pwm} ({motor}), S1+S8={steer_pwm} ({servo})')
+            self.get_logger().info(f'DO_SET_SERVO: S8={thr_pwm} ({motor}), S5+S2+S1={steer_pwm} ({servo})')
 
     def _set_fc_params(self):
         if self.mav is None:
@@ -217,7 +241,7 @@ class NodeMotor(Node):
             (b'FS_THR_ENABLE', 0.0),
         ]
         # Semua channel pake DO_SET_SERVO override langsung
-        for ch in [1, 5, 8]:
+        for ch in [1, 2, 5, 8]:
             params.append((f'SERVO{ch}_FUNCTION'.encode(), 0.0))
         for name, val in params:
             try:
@@ -294,8 +318,9 @@ class NodeMotor(Node):
         return False
 
     def _watchdog(self):
-        if self.mav is None:
-            return
+        with self._mav_lock:
+            if self.mav is None:
+                return
 
         now = time.time()
 
@@ -305,13 +330,16 @@ class NodeMotor(Node):
 
         if now - self._last_cmd_time > 3.0 and self._last_cmd_time > 0:
             self.get_logger().warn('No cmd_vel >3s — sending stop')
-            for ch in [1, 5, 8]:
+            for ch in [1, 2, 5, 8]:
                 try:
-                    self.mav.mav.command_long_send(
-                        self._target_sys, self._target_comp,
-                        self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-                        0, ch, 1500, 0, 0, 0, 0, 0
-                    )
+                    with self._mav_lock:
+                        if self.mav is None:
+                            break
+                        self.mav.mav.command_long_send(
+                            self._target_sys, self._target_comp,
+                            self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                            0, ch, 1500, 0, 0, 0, 0, 0
+                        )
                 except Exception:
                     pass
 
@@ -322,20 +350,32 @@ class NodeMotor(Node):
             float(self.cog), float(self.sog), float(self.battery)
         ]
         self.pub_telemetri.publish(msg)
+        
+        # Also publish FC mode (0=MANUAL, 4=GUIDED, 10=RTL, etc)
+        mode_msg = Int32()
+        mode_msg.data = int(self._fc_mode)
+        self.pub_fc_mode.publish(mode_msg)
 
     def destroy_node(self):
-        if self.mav:
-            try:
-                for ch in [1, 5, 8]:
-                    self.mav.mav.command_long_send(
-                        self._target_sys, self._target_comp,
-                        self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-                        0, ch, 1500, 0, 0, 0, 0, 0
-                    )
-                time.sleep(0.2)
-                self.mav.close()
-            except Exception:
-                pass
+        # Join threads gracefully
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=1.0)
+        if self._read_thread and self._read_thread.is_alive():
+            self._read_thread.join(timeout=1.0)
+        
+        with self._mav_lock:
+            if self.mav:
+                try:
+                    for ch in [1, 2, 5, 8]:
+                        self.mav.mav.command_long_send(
+                            self._target_sys, self._target_comp,
+                            self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                            0, ch, 1500, 0, 0, 0, 0, 0
+                        )
+                    time.sleep(0.2)
+                    self.mav.close()
+                except Exception:
+                    pass
         super().destroy_node()
 
 

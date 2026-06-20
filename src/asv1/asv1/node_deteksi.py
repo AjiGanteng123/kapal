@@ -105,6 +105,7 @@ class NodeDeteksi(Node):
             self.model = None
 
     def _proses(self):
+        # CRITICAL FIX: Check if model is loaded
         if self.model is None:
             return
 
@@ -413,6 +414,21 @@ class NodeDeteksi(Node):
             float(tracking.get('max_area', 0)),
         ]
         self.pub_tracking.publish(msg)
+
+    def destroy_node(self):
+        # CRITICAL FIX: Cleanup resources
+        try:
+            # Clear frame buffer to free memory
+            self.latest = {'utama': None, 'bawah': None, 'samping': None}
+        except Exception:
+            pass
+        try:
+            # Release ONNX model
+            if self.model:
+                self.model = None
+        except Exception:
+            pass
+        super().destroy_node()
 
 
 def main(args=None):

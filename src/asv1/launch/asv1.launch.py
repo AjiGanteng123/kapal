@@ -68,6 +68,15 @@ def generate_launch_description():
         ),
         Node(
             package='asv1',
+            executable='bide_trainer.py',
+            name='bide_trainer',
+            parameters=[config_path],
+            output='screen',
+            respawn=True,
+            respawn_delay=2.0,
+        ),
+        Node(
+            package='asv1',
             executable='viewer.py',
             name='viewer',
             output='screen',

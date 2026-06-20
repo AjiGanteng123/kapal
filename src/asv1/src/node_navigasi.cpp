@@ -1,6 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
+#include <std_msgs/msg/int32.hpp>
 #include <cmath>
 #include <fstream>
 #include <algorithm>
@@ -65,6 +66,10 @@ public:
     sub_obstacle_ = create_subscription<std_msgs::msg::Float32MultiArray>(
       "/asv/obstacle", 10,
       std::bind(&NodeNavigasi::cb_obstacle, this, std::placeholders::_1));
+
+    sub_fc_mode_ = create_subscription<std_msgs::msg::Int32>(
+      "/asv/fc_mode", 10,
+      std::bind(&NodeNavigasi::cb_fc_mode, this, std::placeholders::_1));
 
     timer_ = create_wall_timer(std::chrono::milliseconds(50),
                                std::bind(&NodeNavigasi::control_loop, this));
@@ -142,6 +147,9 @@ private:
   int scan_cycles_ = 0;
   int scan_dir_ = 1;
   int scan_no_detect_cycles_ = 0;
+  
+  int fc_mode_ = 0;  // NEW: FC mode (0=MANUAL, 4=GUIDED, 10=RTL, etc)
+  bool autonomous_enabled_ = true;  // NEW: Allow disabling autonomous
 
   std::ofstream csv_file_;
 
@@ -149,6 +157,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr sub_tracking_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr sub_telemetri_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr sub_obstacle_;
+  rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr sub_fc_mode_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   void cb_tracking(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
@@ -175,6 +184,20 @@ private:
     obstacle_right_ = msg->data[1];
     obstacle_back_ = msg->data[2];
     obstacle_left_ = msg->data[3];
+  }
+
+  void cb_fc_mode(const std_msgs::msg::Int32::SharedPtr msg)
+  {
+    fc_mode_ = msg->data;
+    // FC mode: 0=MANUAL, 4=GUIDED, 10=RTL, 11=LOITER, etc
+    // Only GUIDED (4) allows autonomous control
+    bool was_enabled = autonomous_enabled_;
+    autonomous_enabled_ = (fc_mode_ == 4);  // 4 = GUIDED mode
+    
+    if (was_enabled && !autonomous_enabled_)
+      RCLCPP_WARN(get_logger(), "FC mode changed to %d — AUTONOMOUS DISABLED!", fc_mode_);
+    else if (!was_enabled && autonomous_enabled_)
+      RCLCPP_INFO(get_logger(), "FC mode changed to GUIDED — AUTONOMOUS ENABLED");
   }
 
   double deg2rad(double deg) { return deg * M_PI / 180.0; }
@@ -386,6 +409,13 @@ private:
       RCLCPP_INFO(get_logger(), "MODE: %s -> linear=%.2f, angular=%.2f",
                   mode_names[active_mode], cmd.linear.x, cmd.angular.z);
       last_mode_ = active_mode;
+    }
+
+    // NEW: Safety check — stop autonomous if FC not in GUIDED mode
+    if (!autonomous_enabled_)
+    {
+      cmd.linear.x = 0.0;
+      cmd.angular.z = 0.0;
     }
 
     pub_cmd_->publish(cmd);

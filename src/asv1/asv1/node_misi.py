@@ -8,6 +8,7 @@ from cv_bridge import CvBridge
 import cv2
 import io
 import time
+import os
 from datetime import datetime
 from PIL import Image as PILImage
 
@@ -20,7 +21,6 @@ class NodeMisi(Node):
         self.declare_parameter('firebase_ref', '/kapal/tim-asv-01')
         self.declare_parameter('cloudinary_cloud', '')
         self.declare_parameter('cloudinary_key', '')
-        self.declare_parameter('cloudinary_secret', '')
         self.declare_parameter('cloudinary_folder', 'asv_lomba')
         self.declare_parameter('capture_cooldown', 5.0)
 
@@ -29,9 +29,11 @@ class NodeMisi(Node):
         fb_ref = self.get_parameter('firebase_ref').value
         cld_cloud = self.get_parameter('cloudinary_cloud').value
         cld_key = self.get_parameter('cloudinary_key').value
-        cld_secret = self.get_parameter('cloudinary_secret').value
         self.cld_folder = self.get_parameter('cloudinary_folder').value
         self.capture_cooldown = self.get_parameter('capture_cooldown').value
+
+        # CRITICAL FIX: Read secrets from environment variables, NOT params.yaml
+        cld_secret = os.getenv('CLOUDINARY_SECRET', '')
 
         self.bridge = CvBridge()
         self.last_capture_time = 0
@@ -55,7 +57,7 @@ class NodeMisi(Node):
         if cld_cloud and cld_key and cld_secret:
             self._init_cloudinary(cld_cloud, cld_key, cld_secret)
         else:
-            self.get_logger().info('Cloudinary disabled (isi cloudinary config di params.yaml)')
+            self.get_logger().info('Cloudinary disabled (isi CLOUDINARY_SECRET env var + cloudinary config di params.yaml)')
 
         # Data payload
         self.data_payload = {
@@ -183,6 +185,20 @@ class NodeMisi(Node):
                 self.fb_ref.set(self.data_payload)
             except Exception as e:
                 self.get_logger().warn(f'Firebase write error: {e}')
+
+    def destroy_node(self):
+        # CRITICAL FIX: Cleanup resources and clear sensitive data
+        try:
+            # Clear frame cache
+            self.latest_frame = {'utama': None, 'bawah': None, 'samping': None}
+        except Exception:
+            pass
+        try:
+            # Clear Firebase reference
+            self.fb_ref = None
+        except Exception:
+            pass
+        super().destroy_node()
 
 
 def main(args=None):

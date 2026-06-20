@@ -27,7 +27,7 @@
     publish_scan: true
     frame_id: "laser_frame"
     csv_path: "/tmp/lidar_data.csv"
-    csv_raw: false
+    csv_raw: true                    # NEW: Enable raw CSV recording (all 360° + sectors)
     las_output: true
     las_dir: "/tmp/lidar_las"
 
@@ -37,12 +37,12 @@
     waypoint_lon: 110.434800
     cruise_speed: 0.5
     approach_speed: 0.35
-    visual_p_gain: 0.002
-    visual_i_gain: 0.0001
-    visual_d_gain: 0.0005
-    lpf_alpha: 0.3
-    gps_p_gain: 0.05
-    max_yaw_rate: 0.5
+    visual_p_gain: 1.0
+    visual_i_gain: 0.00
+    visual_d_gain: 0.5
+    lpf_alpha: 0.50
+    gps_p_gain: 1.0
+    max_yaw_rate: 0.45
     obstacle_stop_dist: 0.4
     obstacle_avoid_speed: 0.3
     fusion_dist_min: 0.3
@@ -66,6 +66,11 @@
     firebase_ref: "/kapal/tim-asv-01"
     cloudinary_cloud: "ds2j86wki"
     cloudinary_key: "563889432822331"
-    cloudinary_secret: "Nr7nKUADbjW3w2E-SwCt1EBfC6E"
+    # cloudinary_secret: MOVED TO ENVIRONMENT VARIABLE (CLOUDINARY_SECRET)
     cloudinary_folder: "asv_lomba"
     capture_cooldown: 5.0
+
+/bide_trainer:
+  ros__parameters:
+    output_path: "/tmp/training_data.csv"
+    enable_recording: true          # NEW: Enable training data recording

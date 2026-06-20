@@ -22,6 +22,7 @@ install(PROGRAMS
   asv1/node_lidar.py
   asv1/node_misi.py
   asv1/node_motor.py
+  asv1/bide_trainer.py
   asv1/sim_bridge.py
   scripts/viewer.py
   DESTINATION lib/${PROJECT_NAME})
