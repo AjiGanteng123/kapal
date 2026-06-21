@@ -38,6 +38,7 @@ class NodeMotor(Node):
         self._auto_ready = False
         self._reconnecting = False
         self._fc_mode = 0
+        self._last_mode = -1
         self._startup_cycles = 40
         self._heartbeat_thread = None  # Track thread for cleanup
         self._read_thread = None       # Track thread for cleanup
@@ -142,6 +143,9 @@ class NodeMotor(Node):
                     if src != 255 and src != self.mav.source_system:
                         self._armed = armed
                         self._fc_mode = mode
+                        if mode != self._last_mode:
+                            self._last_mode = mode
+                            self._update_servo_function_by_mode(mode)
                     if not self._gps_received and src != 255:
                         self.get_logger().info(f'HEARTBEAT — sys={src}, armed={armed}, mode={mode}')
                         self._gps_received = True
@@ -180,6 +184,10 @@ class NodeMotor(Node):
         if now - self._last_cmd_time < 0.05:
             return
 
+        # Skip DO_SET_SERVO kalo mode MANUAL/RTL — biar remot kontrol langsung
+        if self._fc_mode != 4:
+            return
+
         linear = max(-self.max_linear, min(self.max_linear, msg.linear.x))
         angular = max(-self.max_angular, min(self.max_angular, msg.angular.z))
 
@@ -197,7 +205,12 @@ class NodeMotor(Node):
             with self._mav_lock:
                 if self.mav is None:
                     return
-                # Throttle: S8 (SERVO8 — Motor ESC), Rudder: S5+S2+S1
+                # Throttle: S5+S8 (Motor ESC), Rudder: S1+S2
+                self.mav.mav.command_long_send(
+                    self._target_sys, self._target_comp,
+                    self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                    0, 5, thr_pwm, 0, 0, 0, 0, 0
+                )
                 self.mav.mav.command_long_send(
                     self._target_sys, self._target_comp,
                     self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
@@ -206,17 +219,12 @@ class NodeMotor(Node):
                 self.mav.mav.command_long_send(
                     self._target_sys, self._target_comp,
                     self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-                    0, 5, steer_pwm, 0, 0, 0, 0, 0
+                    0, 1, steer_pwm, 0, 0, 0, 0, 0
                 )
                 self.mav.mav.command_long_send(
                     self._target_sys, self._target_comp,
                     self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
                     0, 2, steer_pwm, 0, 0, 0, 0, 0
-                )
-                self.mav.mav.command_long_send(
-                    self._target_sys, self._target_comp,
-                    self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-                    0, 1, steer_pwm, 0, 0, 0, 0, 0
                 )
         except Exception as e:
             self.get_logger().warn(f'DO_SET_SERVO error: {e}')
@@ -227,12 +235,12 @@ class NodeMotor(Node):
         if self._log_count % 50 == 0:
             motor = "NYALA" if abs(thr_pwm - 1500) > 20 else "MATI"
             servo = "KANAN" if steer_pwm > 1520 else ("KIRI" if steer_pwm < 1480 else "LURUS")
-            self.get_logger().info(f'DO_SET_SERVO: S8={thr_pwm} ({motor}), S5+S2+S1={steer_pwm} ({servo})')
+            self.get_logger().info(f'DO_SET_SERVO: S5+S8={thr_pwm} ({motor}), S1+S2={steer_pwm} ({servo})')
 
     def _set_fc_params(self):
         if self.mav is None:
             return
-        servo_channels = [1, 5]
+        servo_channels = [1, 2, 5, 8]
         params = [
             (b'ARMING_CHECK', 0.0),
             (b'BRD_SAFETYENABLE', 0.0),
@@ -240,9 +248,12 @@ class NodeMotor(Node):
             (b'FS_TIMEOUT', 2.0),
             (b'FS_THR_ENABLE', 0.0),
         ]
-        # Semua channel pake DO_SET_SERVO override langsung
-        for ch in [1, 2, 5, 8]:
-            params.append((f'SERVO{ch}_FUNCTION'.encode(), 0.0))
+        # Mode GUIDED → SERVO_FUNCTION=0 (biar DO_SET_SERVO kontrol)
+        # Mode MANUAL/RTL → SERVO_FUNCTION=70/73 (biar remot kontrol)
+        params.append((b'SERVO1_FUNCTION', 0.0))
+        params.append((b'SERVO2_FUNCTION', 0.0))
+        params.append((b'SERVO5_FUNCTION', 0.0))
+        params.append((b'SERVO8_FUNCTION', 0.0))
         for name, val in params:
             try:
                 self.mav.mav.param_set_send(
@@ -252,7 +263,32 @@ class NodeMotor(Node):
                 time.sleep(0.15)
             except Exception as e:
                 self.get_logger().warn(f'Param {name} set error: {e}')
-        self.get_logger().info('FC params: SAFETY=0, SERVO[1,5,8]_FUNCTION=0')
+        self.get_logger().info('FC params set: safety=0, servo_fn=0 (DO_SET_SERVO mode)')
+
+    def _update_servo_function_by_mode(self, mode):
+        if self.mav is None:
+            return
+        if mode == 4:
+            # GUIDED — SERVO_FUNCTION=0 biar DO_SET_SERVO kontrol
+            vals = [(b'SERVO1_FUNCTION', 0.0), (b'SERVO2_FUNCTION', 0.0),
+                    (b'SERVO5_FUNCTION', 0.0), (b'SERVO8_FUNCTION', 0.0)]
+            label = 'GUIDED → servo_fn=0 (program kontrol)'
+        else:
+            # MANUAL/RTL — SERVO_FUNCTION=70/73 biar remot kontrol
+            vals = [(b'SERVO1_FUNCTION', 73.0), (b'SERVO2_FUNCTION', 73.0),
+                    (b'SERVO5_FUNCTION', 70.0), (b'SERVO8_FUNCTION', 70.0)]
+            label = f'mode {mode} → servo_fn=70/73 (remot kontrol)'
+        for name, val in vals:
+            try:
+                with self._mav_lock:
+                    self.mav.mav.param_set_send(
+                        self._target_sys, self._target_comp,
+                        name, val, 9
+                    )
+                time.sleep(0.05)
+            except Exception:
+                pass
+        self.get_logger().info(label)
 
     def _setup_auto_control(self):
         self.get_logger().info('=== AUTO CONTROL SETUP ===')
@@ -326,22 +362,25 @@ class NodeMotor(Node):
 
         if now - self._last_heartbeat > 5.0 and self._last_heartbeat > 0:
             self.get_logger().warn(f'Heartbeat lost ({now - self._last_heartbeat:.0f}s)')
-            self._reconnect()
+            # CRITICAL FIX: Run reconnect in separate thread to avoid blocking
+            threading.Thread(target=self._reconnect, daemon=True).start()
 
         if now - self._last_cmd_time > 3.0 and self._last_cmd_time > 0:
+            if self._fc_mode != 4:
+                return
             self.get_logger().warn('No cmd_vel >3s — sending stop')
             for ch in [1, 2, 5, 8]:
-                try:
-                    with self._mav_lock:
-                        if self.mav is None:
-                            break
-                        self.mav.mav.command_long_send(
-                            self._target_sys, self._target_comp,
-                            self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
-                            0, ch, 1500, 0, 0, 0, 0, 0
-                        )
-                except Exception:
-                    pass
+                    try:
+                        with self._mav_lock:
+                            if self.mav is None:
+                                break
+                            self.mav.mav.command_long_send(
+                                self._target_sys, self._target_comp,
+                                self._mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                                0, ch, 1500, 0, 0, 0, 0, 0
+                            )
+                    except Exception:
+                        pass
 
     def publish_telemetry(self):
         msg = Float32MultiArray()

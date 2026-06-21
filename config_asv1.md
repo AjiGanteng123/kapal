@@ -27,10 +27,8 @@ Edit di `~/robot_ws/src/asv1/config/params.yaml`.
 
 | Fungsi | Pin | SERVO | ch |
 |--------|:---:|:-----:|:--:|
-| Motor ESC | S8 | SERVO8 | 8 |
-| Rudder kanan | S5 | SERVO5 | 5 |
-| Rudder kiri | S2 | SERVO2 | 2 |
-| (cadangan) | S1 | SERVO1 | 1 |
+| Motor ESC | S5+S8 | SERVO5+SERVO8 | 5+8 |
+| Rudder | S1+S2 | SERVO1+SERVO2 | 1+2 |
 
 ## Obstacle / Fusion
 

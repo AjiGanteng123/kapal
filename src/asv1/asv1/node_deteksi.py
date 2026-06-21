@@ -22,12 +22,20 @@ class NodeDeteksi(Node):
         self.declare_parameter('required_frames', 5)
         self.declare_parameter('horizon_ratio', 0.33)
         self.declare_parameter('inference_interval_ms', 100)
+        self.declare_parameter('capture_conf_threshold', 0.8)
+        self.declare_parameter('capture_min_area', 2000)
+        self.declare_parameter('capture_blur_threshold', 100.0)
+        self.declare_parameter('capture_position_margin', 0.25)
 
         model_path = self.get_parameter('model_path').value
         self.conf_threshold = self.get_parameter('conf_threshold').value
         self.mission_conf_threshold = self.get_parameter('mission_conf_threshold').value
         self.required_frames = self.get_parameter('required_frames').value
         self.horizon_ratio = self.get_parameter('horizon_ratio').value
+        self.capture_conf_threshold = self.get_parameter('capture_conf_threshold').value
+        self.capture_min_area = self.get_parameter('capture_min_area').value
+        self.capture_blur_threshold = self.get_parameter('capture_blur_threshold').value
+        self.capture_position_margin = self.get_parameter('capture_position_margin').value
         interval = max(0.05, self.get_parameter('inference_interval_ms').value / 1000.0)
 
         self.bridge = CvBridge()
@@ -47,6 +55,7 @@ class NodeDeteksi(Node):
         self.pub_tracking = self.create_publisher(Float32MultiArray, '/asv/tracking', 10)
         self.pub_trigger = self.create_publisher(Int32, '/asv/trigger', 10)
         self.pub_vizu = self.create_publisher(Image, '/asv/vizu', 10)
+        self.pub_capture_trigger = self.create_publisher(Int32, '/asv/capture_trigger', 10)
 
         self.sub_utama = self.create_subscription(
             Image, '/asv/kamera/utama', lambda m: self._store('utama', m), 1)
@@ -61,6 +70,7 @@ class NodeDeteksi(Node):
         self.get_logger().info(f'Inference interval: {interval:.3f}s, conf_threshold: {self.conf_threshold}')
 
         self._load_model(model_path)
+        self._last_auto_trigger_time = 0
 
     def _load_model(self, path):
         try:
@@ -121,6 +131,13 @@ class NodeDeteksi(Node):
 
                 all_detections.extend(dets)
 
+                # Auto-trigger saat tracking aktif (2 bola terdeteksi)
+                if trigger_cam == 0 and tracking['status'] == 1:
+                    now = self.get_clock().now().nanoseconds / 1e9
+                    if (now - self._last_auto_trigger_time) > 5.0:
+                        trigger_cam = 1
+                        self._last_auto_trigger_time = now
+
                 if trigger_cam > 0:
                     trigger = trigger_cam
 
@@ -162,6 +179,9 @@ class NodeDeteksi(Node):
             self.pub_trigger.publish(Int32(data=trigger))
             if trigger > 0:
                 self.get_logger().info(f'TRIGGER: {trigger} (1=surface, 2=underwater)')
+            
+            # Publish capture trigger for node_misi (1=surface capture, 2=underwater capture)
+            self.pub_capture_trigger.publish(Int32(data=trigger))
 
             if vizu_frame is not None:
                 try:
@@ -243,26 +263,34 @@ class NodeDeteksi(Node):
         dets = self._nms(dets, 0.45)
         return dets
 
-    def _detect_colors(self, frame_640):
-        hsv = cv2.cvtColor(frame_640, cv2.COLOR_BGR2HSV)
-        dets = []
+    def _validate_capture(self, frame, det):
+        cls_id = int(det[0])
+        conf = float(det[1])
+        x1, y1, x2, y2 = int(det[2]), int(det[3]), int(det[4]), int(det[5])
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        area = (x2 - x1) * (y2 - y1)
+        h, w = frame.shape[:2]
 
-        green_mask = cv2.inRange(hsv, (20, 40, 40), (100, 255, 255))
-        red_mask = cv2.inRange(hsv, (0, 40, 40), (20, 255, 255)) | \
-                   cv2.inRange(hsv, (160, 40, 40), (180, 255, 255))
+        if conf < self.capture_conf_threshold:
+            return False
 
-        for cls_id, mask in [(0, green_mask), (1, red_mask)]:
-            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in cnts:
-                if cv2.contourArea(cnt) < 80:
-                    continue
-                x, y, w, h = cv2.boundingRect(cnt)
-                dets.append([cls_id, 0.85, float(x), float(y),
-                             float(x + w), float(y + h)])
+        margin_x = w * self.capture_position_margin
+        margin_y = h * self.capture_position_margin
+        if cx < margin_x or cx > w - margin_x or cy < margin_y or cy > h - margin_y:
+            return False
 
-        dets = self._nms(dets, 0.45)
-        return dets
+        if area < self.capture_min_area:
+            return False
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        crop = gray[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+        if crop.size > 0:
+            variance = cv2.Laplacian(crop, cv2.CV_64F).var()
+            if variance < self.capture_blur_threshold:
+                return False
+
+        return True
 
     def _proses_kamera(self, frame, camera):
         h_orig, w_orig = frame.shape[:2]
@@ -295,6 +323,8 @@ class NodeDeteksi(Node):
             underwater_detected = False
         else:
             surface_detected = False
+            green_list = []
+            red_list = []
 
         for det in raw_boxes:
             cls_id = int(det[0])
@@ -322,8 +352,11 @@ class NodeDeteksi(Node):
                         red_list.append(target)
             elif camera == 'bawah' and cls_id == 3 and conf > self.mission_conf_threshold:
                 underwater_detected = True
-            elif camera == 'samping' and cls_id == 2 and conf > self.mission_conf_threshold:
-                surface_detected = True
+            elif camera == 'samping' and cls_id in (0, 1) and cy >= horizon_y:
+                if cls_id == 0:
+                    green_list.append({'x': cx, 'y': cy, 'area': area, 'conf': conf})
+                else:
+                    red_list.append({'x': cx, 'y': cy, 'area': area, 'conf': conf})
 
         if camera == 'utama':
             if not surface_detected:
@@ -387,12 +420,46 @@ class NodeDeteksi(Node):
                     trigger = 2
 
         elif camera == 'samping':
-            if not surface_detected:
-                self.detection_counter['surface'] = 0
+            # Validasi bola: harus ada minimal 1 bola (merah atau hijau) dengan conf tinggi & ukuran cukup
+            ball_detected = False
+            if green_list:
+                green_list.sort(key=lambda b: b['area'], reverse=True)
+                best = green_list[0]
+                if best['conf'] > self.capture_conf_threshold and best['area'] > self.capture_min_area:
+                    tracking['coords']['green'] = (int(best['x']), int(best['y']))
+                    tracking['max_area'] = max(tracking['max_area'], best['area'])
+                    ball_detected = True
+
+            if red_list:
+                red_list.sort(key=lambda b: b['area'], reverse=True)
+                best = red_list[0]
+                if best['conf'] > self.capture_conf_threshold and best['area'] > self.capture_min_area:
+                    tracking['coords']['red'] = (int(best['x']), int(best['y']))
+                    tracking['max_area'] = max(tracking['max_area'], best['area'])
+                    ball_detected = True
+
+            # Gambar bola terdeteksi
+            if 'green' in tracking['coords']:
+                gx, gy = tracking['coords']['green']
+                cv2.rectangle(annotated, (gx - 15, gy - 15), (gx + 15, gy + 15), (0, 255, 0), 2)
+            if 'red' in tracking['coords']:
+                rx, ry = tracking['coords']['red']
+                cv2.rectangle(annotated, (rx - 15, ry - 15), (rx + 15, ry + 15), (0, 0, 255), 2)
+
+            # Trigger kalau bola valid
+            if ball_detected:
+                surface_detected = True  # Mark for trigger counting
             else:
+                surface_detected = False
+                
+            if surface_detected:
                 self.detection_counter['surface'] += 1
                 if self.detection_counter['surface'] >= self.required_frames:
                     trigger = 1
+            else:
+                self.detection_counter['surface'] = 0
+
+            tracking['status'] = 1 if ball_detected else 0
 
         return detections, tracking, trigger, annotated
 

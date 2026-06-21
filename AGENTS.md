@@ -42,8 +42,9 @@ PROJECT FOCUS:
 ### Robot: ASV1 (Autonomous Surface Vehicle)
 - **FC**: SpeedyBee F405 Wing (ArduRover)
 - **LiDAR**: RPLIDAR C1 (USB, 460800 baud)
-- **Motor**: ESC on S8, Rudders on S1 (kiri) + S5 (kanan)
+- **Motor**: ESC on S5+S8 (ch=5+8), Rudders on S1+S2 (ch=1+2)
 - **Protocol**: MAVLink via pymavlink (DO_SET_SERVO)
+- SERVO_FUNCTION: S1/S2=73 (steering), S5/S8=70 (throttle) — biar remot kerja di MANUAL
 
 ### Package: `asv1` (~/robot_ws/src/asv1)
 
@@ -53,15 +54,23 @@ PROJECT FOCUS:
 | `node_deteksi` | `asv1/node_deteksi.py` | YOLO tracking, pub `/asv/tracking` |
 | `node_lidar` | `asv1/node_lidar.py` | RPLidar C1 → `/asv/obstacle` + `/scan` |
 | `node_navigasi` | `src/node_navigasi.cpp` | PID control, priority: Obstacle > Visual > GPS |
-| `node_motor` | `asv1/node_motor.py` | MAVLink DO_SET_SERVO (ch=1,5,8) |
+| `node_motor` | `asv1/node_motor.py` | MAVLink DO_SET_SERVO (ch=1,2,5,8) — ESC di S5+S8, rudder di S1+S2. Skip DO_SET_SERVO kalo mode != GUIDED biar remot bisa override. SERVO_FUNCTION: 70=throttle, 73=steering |
 | `node_misi` | `asv1/node_misi.py` | Firebase + Cloudinary |
 
 ### Motor Mapping (DO_SET_SERVO)
 | Fungsi | Pin | ch |
 |--------|:---:|:--:|
-| Motor ESC | S8 | 8 |
-| Rudder kanan | S5 | 5 |
-| Rudder kiri | S1 | 1 |
+| Motor ESC | S5+S8 | 5+8 |
+| Rudder | S1+S2 | 1+2 |
+
+### RC Mode Switch (3-pos)
+| Posisi | Mode | Fungsi |
+|:------:|------|--------|
+| 1 | MANUAL (0) | Remot kontrol langsung (SERVO_FUNCTION=70/73) |
+| 2 | RTL (10) | Auto return ke home |
+| 3 | GUIDED (4) | Program kendali via DO_SET_SERVO |
+
+> Program otomatis skip DO_SET_SERVO kalo mode != GUIDED, jadi remot bebas kontrol di MANUAL/RTL.
 
 ### Topics
 | Topic | Type | Pub |
@@ -118,5 +127,5 @@ PID, port, threshold, model path, dll.
 - Kamera: `/dev/video0` (bisa kosong = dry mode)
 - S3/S4 conflict ADC — jangan dipake
 - S6/S7 conflict fungsi lain — jangan dipake
-- FC harus mode GUIDED + ARMED
-- SERVO*_FUNCTION harus = 0 untuk DO_SET_SERVO
+- SERVO_FUNCTION: S1/S2=73 (steering), S5/S8=70 (throttle) — biar remot kerja di MANUAL
+- Program cuma kirim DO_SET_SERVO kalo mode GUIDED (4). Kalo mode MANUAL/RTL, program diem, remot kontrol penuh

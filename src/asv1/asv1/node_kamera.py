@@ -10,7 +10,7 @@ import cv2
 class NodeKamera(Node):
     def __init__(self):
         super().__init__('node_kamera')
-        self.declare_parameter('device_utama', 0)
+        self.declare_parameter('device_utama', '0')
         self.declare_parameter('device_bawah', '')
         self.declare_parameter('device_samping', '')
         self.declare_parameter('fps_utama', 30)

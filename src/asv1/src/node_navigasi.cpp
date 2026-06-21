@@ -249,7 +249,7 @@ private:
     else
     {
       if (has_midpoint_ && tracking_status_ == 1)
-        scan_no_detect_cycles_ = 0;
+        scan_no_detect_cycles_ = 0;  // CRITICAL FIX: Reset when detection active
       else
         scan_no_detect_cycles_++;
 
@@ -388,6 +388,11 @@ private:
         prev_error_ = 0.0;
         prev_angular_z_ = 0.0;
         arrival_cycles_ = 0;
+      }
+      else
+      {
+        // CRITICAL FIX: Reset scan counter when in visual/fusion mode
+        scan_no_detect_cycles_ = 0;
       }
     }
 

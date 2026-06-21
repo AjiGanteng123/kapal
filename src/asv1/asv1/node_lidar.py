@@ -135,6 +135,10 @@ class NodeLidar(Node):
         self.pub_obstacle = self.create_publisher(Float32MultiArray, '/asv/obstacle', 10)
         self.pub_scan = self.create_publisher(LaserScan, '/scan', 10) if pub_scan else None
 
+        self._latest_scan = None
+        self._scan_lock = threading.Lock()
+        self._scan_thread = None
+
         self._csv_file = open(csv_path, 'w', newline='')
         self._csv_writer = csv.writer(self._csv_file)
         if self._csv_raw:
@@ -166,7 +170,8 @@ class NodeLidar(Node):
         else:
             self.get_logger().info('LiDAR disabled (serial_port empty)')
 
-        self.create_timer(0.1, self._baca)
+        # CRITICAL FIX: Use timer to publish latest data, not read serial
+        self.create_timer(0.1, self._publish)
         self.get_logger().info(f'node_lidar started ({"LIVE" if self.c1 else "DRY MODE"})')
 
     def _connect(self):
@@ -180,6 +185,10 @@ class NodeLidar(Node):
             time.sleep(1)
             self._scan_dsize = self.c1.start_scan()
             self.get_logger().info(f'Scan started (dsize={self._scan_dsize})')
+            
+            # CRITICAL FIX: Start scan reading in separate thread
+            self._scan_thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._scan_thread.start()
         except Exception as e:
             self.get_logger().warn(f'RPLidar C1 not available ({e})')
             if self.c1:
@@ -202,131 +211,161 @@ class NodeLidar(Node):
         else:
             self.get_logger().warn('LiDAR reconnect failed')
 
-    def _baca(self):
+    def _read_loop(self):
+        """
+        CRITICAL FIX: Continuous scan reading in separate thread
+        This prevents blocking ROS timer callbacks
+        """
+        while rclpy.ok() and self.c1 is not None:
+            try:
+                self._read_and_process_scan()
+            except Exception as e:
+                self._lidar_failures += 1
+                self.get_logger().warn(f'LiDAR error ({self._lidar_failures}x): {e}')
+                if self._lidar_failures >= 3:
+                    self._reconnect_lidar()
+                    break
+                time.sleep(0.1)
+
+    def _read_and_process_scan(self):
+        """Read one complete scan and store to latest_scan"""
         if self.c1 is None:
             return
 
-        try:
-            if not self._connected_once:
-                self._connected_once = True
-                self.get_logger().info('RPLidar C1 scan membaca...')
+        if not self._connected_once:
+            self._connected_once = True
+            self.get_logger().info('RPLidar C1 scan membaca...')
 
-            sample = self.c1.read_scan_sample(self._scan_dsize)
-            if sample is None:
-                return
+        sample = self.c1.read_scan_sample(self._scan_dsize)
+        if sample is None:
+            return
 
-            new_scan, quality, angle, distance = sample
+        new_scan, quality, angle, distance = sample
 
-            scan = []
-            scan.append((new_scan, quality, angle, distance))
+        scan = []
+        scan.append((new_scan, quality, angle, distance))
 
-            for _ in range(359):
-                s = self.c1.read_scan_sample(self._scan_dsize)
-                if s is None:
-                    break
-                scan.append((s[0], s[1], s[2], s[3]))
+        for _ in range(359):
+            s = self.c1.read_scan_sample(self._scan_dsize)
+            if s is None:
+                break
+            scan.append((s[0], s[1], s[2], s[3]))
 
-            angles = [math.radians(m[2]) for m in scan]
-            ranges = [m[3] / 1000.0 for m in scan]
+        self._lidar_failures = 0
 
-            self._lidar_failures = 0
-
-            sector_size = 360 // self.num_sectors
-            min_distances = []
-            for i in range(self.num_sectors):
-                start_deg = i * sector_size
-                end_deg = start_deg + sector_size
-                sector_ranges = []
-                for m in scan:
-                    deg = m[2]
-                    if start_deg <= deg < end_deg:
-                        d = m[3] / 1000.0
-                        if 0.1 < d < 12.0:
-                            sector_ranges.append(d)
-                if sector_ranges:
-                    min_distances.append(min(sector_ranges))
-                else:
-                    min_distances.append(12.0)
-
-            msg = Float32MultiArray()
-            msg.data = min_distances
-            self.pub_obstacle.publish(msg)
-
-            now = self.get_clock().now().nanoseconds / 1e9
-            if self._csv_raw:
-                scan_ranges = [12.0] * 360
-                for m in scan:
-                    deg = int(m[2]) % 360
+        sector_size = 360 // self.num_sectors
+        min_distances = []
+        for i in range(self.num_sectors):
+            start_deg = i * sector_size
+            end_deg = start_deg + sector_size
+            sector_ranges = []
+            for m in scan:
+                deg = m[2]
+                if start_deg <= deg < end_deg:
                     d = m[3] / 1000.0
                     if 0.1 < d < 12.0:
-                        scan_ranges[deg] = d
-                self._csv_writer.writerow([f'{now:.3f}'] + [f'{d:.3f}' for d in min_distances] + [f'{d:.3f}' for d in scan_ranges])
+                        sector_ranges.append(d)
+            if sector_ranges:
+                min_distances.append(min(sector_ranges))
             else:
-                self._csv_writer.writerow([f'{now:.3f}'] + [f'{d:.3f}' for d in min_distances])
-            self._csv_count += 1
-            if self._csv_count % 100 == 0:
-                self._csv_file.flush()
-                self.get_logger().info(f'CSV: {self._csv_count} rows written')
+                min_distances.append(12.0)
 
-            if min_distances[0] < self.obstacle_distance:
-                self.get_logger().warn(f'OBSTACLE DEPAN: {min_distances[0]:.2f}m!', throttle_duration_sec=1)
-            sektor_labels = ['depan', 'kanan', 'belakang', 'kiri']
-            for i, d in enumerate(min_distances):
-                if d < self.obstacle_distance:
-                    self.get_logger().warn(f'  {sektor_labels[i]}: {d:.2f}m', throttle_duration_sec=2)
+        # Store to latest_scan with lock
+        with self._scan_lock:
+            self._latest_scan = {
+                'min_distances': min_distances,
+                'scan': scan,
+                'timestamp': time.time()
+            }
 
-            if self.pub_scan:
-                scan_msg = LaserScan()
-                scan_msg.header.frame_id = self.frame_id
-                scan_msg.header.stamp = self.get_clock().now().to_msg()
-                scan_msg.angle_min = 0.0
-                scan_msg.angle_max = 2 * math.pi
-                scan_msg.angle_increment = (2 * math.pi) / 360
-                scan_msg.time_increment = 0.0
-                scan_msg.scan_time = 0.1
-                scan_msg.range_min = 0.1
-                scan_msg.range_max = 12.0
-                scan_msg.ranges = [12.0] * 360
-                for m in scan:
-                    deg = int(m[2]) % 360
-                    d = m[3] / 1000.0
-                    if 0.1 < d < 12.0:
-                        scan_msg.ranges[deg] = d
-                self.pub_scan.publish(scan_msg)
+    def _publish(self):
+        """Publish latest scan data from timer callback (non-blocking)"""
+        with self._scan_lock:
+            if self._latest_scan is None:
+                return
+            data = self._latest_scan.copy()
 
-            if self._las_output:
-                for m in scan:
-                    deg_rad = math.radians(m[2])
-                    d = m[3] / 1000.0
-                    if 0.1 < d < 12.0:
-                        x = d * math.cos(deg_rad)
-                        y = d * math.sin(deg_rad)
-                        self._las_pts.append([x, y, 0.0])
-                self._las_scan_count += 1
-                if self._las_scan_count % 10 == 0:
-                    ts = time.strftime('%H%M%S')
-                    fname = f'{self._las_dir}/scan_{ts}.las'
-                    header = laspy.LasHeader(point_format=3, version="1.2")
-                    header.x_scale = 0.001
-                    header.y_scale = 0.001
-                    header.z_scale = 0.001
-                    header.x_offset = 0
-                    header.y_offset = 0
-                    header.z_offset = 0
-                    las = laspy.LasData(header)
-                    las.x = [p[0] for p in self._las_pts]
-                    las.y = [p[1] for p in self._las_pts]
-                    las.z = [p[2] for p in self._las_pts]
-                    las.write(fname)
-                    n = len(self._las_pts)
-                    self._las_pts = []
-                    self.get_logger().info(f'LAS saved: {fname} ({n} points)')
+        min_distances = data['min_distances']
+        scan = data['scan']
 
-        except Exception as e:
-            self._lidar_failures += 1
-            self.get_logger().warn(f'LiDAR error ({self._lidar_failures}x): {e}')
-            if self._lidar_failures >= 3:
-                self._reconnect_lidar()
+        # Publish obstacle
+        msg = Float32MultiArray()
+        msg.data = min_distances
+        self.pub_obstacle.publish(msg)
+
+        # CSV logging
+        now = self.get_clock().now().nanoseconds / 1e9
+        if self._csv_raw:
+            scan_ranges = [12.0] * 360
+            for m in scan:
+                deg = int(m[2]) % 360
+                d = m[3] / 1000.0
+                if 0.1 < d < 12.0:
+                    scan_ranges[deg] = d
+            self._csv_writer.writerow([f'{now:.3f}'] + [f'{d:.3f}' for d in min_distances] + [f'{d:.3f}' for d in scan_ranges])
+        else:
+            self._csv_writer.writerow([f'{now:.3f}'] + [f'{d:.3f}' for d in min_distances])
+        self._csv_count += 1
+        if self._csv_count % 100 == 0:
+            self._csv_file.flush()
+            self.get_logger().info(f'CSV: {self._csv_count} rows written')
+
+        # Warnings
+        if min_distances[0] < self.obstacle_distance:
+            self.get_logger().warn(f'OBSTACLE DEPAN: {min_distances[0]:.2f}m!', throttle_duration_sec=1)
+        sektor_labels = ['depan', 'kanan', 'belakang', 'kiri']
+        for i, d in enumerate(min_distances):
+            if d < self.obstacle_distance:
+                self.get_logger().warn(f'  {sektor_labels[i]}: {d:.2f}m', throttle_duration_sec=2)
+
+        # Publish LaserScan
+        if self.pub_scan:
+            scan_msg = LaserScan()
+            scan_msg.header.frame_id = self.frame_id
+            scan_msg.header.stamp = self.get_clock().now().to_msg()
+            scan_msg.angle_min = 0.0
+            scan_msg.angle_max = 2 * math.pi
+            scan_msg.angle_increment = (2 * math.pi) / 360
+            scan_msg.time_increment = 0.0
+            scan_msg.scan_time = 0.1
+            scan_msg.range_min = 0.1
+            scan_msg.range_max = 12.0
+            scan_msg.ranges = [12.0] * 360
+            for m in scan:
+                deg = int(m[2]) % 360
+                d = m[3] / 1000.0
+                if 0.1 < d < 12.0:
+                    scan_msg.ranges[deg] = d
+            self.pub_scan.publish(scan_msg)
+
+        # LAS output
+        if self._las_output:
+            for m in scan:
+                deg_rad = math.radians(m[2])
+                d = m[3] / 1000.0
+                if 0.1 < d < 12.0:
+                    x = d * math.cos(deg_rad)
+                    y = d * math.sin(deg_rad)
+                    self._las_pts.append([x, y, 0.0])
+            self._las_scan_count += 1
+            if self._las_scan_count % 10 == 0:
+                ts = time.strftime('%H%M%S')
+                fname = f'{self._las_dir}/scan_{ts}.las'
+                header = laspy.LasHeader(point_format=3, version="1.2")
+                header.x_scale = 0.001
+                header.y_scale = 0.001
+                header.z_scale = 0.001
+                header.x_offset = 0
+                header.y_offset = 0
+                header.z_offset = 0
+                las = laspy.LasData(header)
+                las.x = [p[0] for p in self._las_pts]
+                las.y = [p[1] for p in self._las_pts]
+                las.z = [p[2] for p in self._las_pts]
+                las.write(fname)
+                n = len(self._las_pts)
+                self._las_pts = []
+                self.get_logger().info(f'LAS saved: {fname} ({n} points)')
 
     def _save_las(self, pts, suffix='final'):
         if not pts:

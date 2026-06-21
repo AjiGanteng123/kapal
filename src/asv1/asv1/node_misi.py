@@ -9,7 +9,7 @@ import cv2
 import io
 import time
 import os
-from datetime import datetime
+import threading
 from PIL import Image as PILImage
 
 
@@ -36,15 +36,16 @@ class NodeMisi(Node):
         cld_secret = os.getenv('CLOUDINARY_SECRET', '')
 
         self.bridge = CvBridge()
-        self.last_capture_time = 0
-        self.trigger = 0
+        self.last_capture_time = {'surface': 0, 'underwater': 0}
         self.telemetri = None
         self.latest_frame = {'utama': None, 'bawah': None, 'samping': None}
         self._cam_received = {'utama': False, 'bawah': False, 'samping': False}
+        self._upload_lock = threading.Lock()
 
         self.get_logger().info('=== MISI NODE START ===')
         self.get_logger().info(f'Firebase: key={key_path}, url={fb_url[:30] if fb_url else "NONE"}...')
         self.get_logger().info(f'Cloudinary: cloud={cld_cloud}, folder={self.cld_folder}')
+        self.get_logger().info(f'Capture mode: DETECTION-BASED (cooldown={self.capture_cooldown}s)')
 
         # Firebase
         self.fb_ref = None
@@ -76,7 +77,10 @@ class NodeMisi(Node):
             "mission_images": {"surface": None, "underwater": None},
         }
 
-        self.sub_trigger = self.create_subscription(Int32, '/asv/trigger', self._cb_trigger, 10)
+        # CRITICAL CHANGE: Subscribe to /asv/capture_trigger instead of timer
+        self.sub_capture_trigger = self.create_subscription(
+            Int32, '/asv/capture_trigger', self._cb_capture_trigger, 10)
+        
         self.sub_telemetri = self.create_subscription(
             Float32MultiArray, '/asv/telemetri', self._cb_telemetri, 10)
 
@@ -85,8 +89,8 @@ class NodeMisi(Node):
                 Image, f'/asv/kamera/{cam}',
                 lambda m, c=cam: self._store(c, m), 1)
 
-        self.create_timer(1.0, self._worker)
-        self.get_logger().info('node_misi started')
+        self.create_timer(1.0, self._update_firebase)
+        self.get_logger().info('node_misi started (detection-based capture)')
 
     def _init_firebase(self, key_path, url, ref_path):
         try:
@@ -118,11 +122,62 @@ class NodeMisi(Node):
         except Exception as e:
             self.get_logger().warn(f'Camera {camera} decode error: {e}')
 
-    def _cb_trigger(self, msg):
-        self.trigger = msg.data
-        if self.trigger > 0:
-            jenis = 'surface' if self.trigger == 1 else 'underwater'
-            self.get_logger().info(f'TRIGGER diterima: {jenis}')
+    def _cb_capture_trigger(self, msg):
+        """
+        DETECTION-BASED CAPTURE TRIGGER
+        Called when object detection finds target object
+        trigger=1: surface object detected
+        trigger=2: underwater object detected
+        """
+        trigger = msg.data
+        if trigger == 0:
+            return
+        
+        now = time.time()
+        capture_type = 'surface' if trigger == 1 else 'underwater'
+        
+        # Check cooldown
+        if (now - self.last_capture_time[capture_type]) < self.capture_cooldown:
+            remaining = self.capture_cooldown - (now - self.last_capture_time[capture_type])
+            self.get_logger().info(f'{capture_type.upper()} trigger ignored (cooldown {remaining:.1f}s remaining)')
+            return
+        
+        # Select camera based on trigger type
+        # CRITICAL: Capture dari kamera SAMPING (webcam laptop untuk testing)
+        if trigger == 1:  # surface
+            camera = 'samping'
+        else:  # underwater
+            camera = 'bawah'
+        
+        frame = self.latest_frame.get(camera)
+        if frame is None:
+            self.get_logger().warn(f'{capture_type.upper()} capture failed: no frame from {camera}')
+            return
+        
+        self.last_capture_time[capture_type] = now
+        self.get_logger().info(f'{capture_type.upper()} OBJECT DETECTED → capturing from {camera}...')
+        
+        # Upload in separate thread (non-blocking)
+        threading.Thread(
+            target=self._do_upload,
+            args=(frame.copy(), capture_type),
+            daemon=True
+        ).start()
+
+    def _do_upload(self, frame, capture_type):
+        """Upload frame to Cloudinary in background thread"""
+        try:
+            url = self._upload_to_cloudinary(frame)
+            with self._upload_lock:
+                if url:
+                    self.data_payload["mission_images"][capture_type] = url
+                    self.data_payload["position_log"][f"{capture_type}_imaging"] = "Done"
+                    self.get_logger().info(f'{capture_type.upper()} upload OK → {url}')
+                else:
+                    self.data_payload["position_log"][f"{capture_type}_imaging"] = "Failed"
+                    self.get_logger().warn(f'{capture_type.upper()} upload failed')
+        except Exception as e:
+            self.get_logger().error(f'{capture_type.upper()} upload error: {e}')
 
     def _cb_telemetri(self, msg):
         if len(msg.data) >= 6:
@@ -136,65 +191,37 @@ class NodeMisi(Node):
             buffer = io.BytesIO()
             img.save(buffer, format='JPEG', quality=80)
             buffer.seek(0)
-            self.get_logger().info('Uploading to Cloudinary...')
             res = cloudinary.uploader.upload(buffer, folder=self.cld_folder)
             url = res.get('secure_url')
-            if url:
-                self.get_logger().info(f'Upload OK: {url}')
             return url
         except Exception as e:
-            self.get_logger().warn(f'Upload failed: {e}')
+            self.get_logger().warn(f'Cloudinary upload error: {e}')
             return None
 
-    def _worker(self):
-        now = time.time()
-        trigger = self.trigger
-        self.trigger = 0
-
+    def _update_firebase(self):
+        """Update telemetry to Firebase (called every 1s)"""
         # Update telemetry in payload
         if self.telemetri is not None:
-            self.data_payload["gps_location"]["lat"] = self.telemetri[0]
-            self.data_payload["gps_location"]["lon"] = self.telemetri[1]
-            self.data_payload["attitude"]["heading"] = self.telemetri[2]
-
-        # Process capture trigger
-        if trigger > 0 and (now - self.last_capture_time) > self.capture_cooldown:
-            if trigger == 1:
-                cam_name = 'utama'
-                status_key = 'surface_imaging'
-            else:
-                cam_name = 'bawah'
-                status_key = 'underwater_imaging'
-
-            frame = self.latest_frame.get(cam_name)
-            if frame is not None:
-                self.data_payload["position_log"][status_key] = "In Progress"
-                url = self._upload_to_cloudinary(frame)
-                if url:
-                    self.data_payload["mission_images"][
-                        'surface' if trigger == 1 else 'underwater'] = url
-                    self.data_payload["position_log"][status_key] = "Done"
-                    self.get_logger().info(f'Captured {cam_name} -> {url}')
-                else:
-                    self.data_payload["position_log"][status_key] = "Failed"
-                self.last_capture_time = now
+            with self._upload_lock:
+                self.data_payload["gps_location"]["lat"] = self.telemetri[0]
+                self.data_payload["gps_location"]["lon"] = self.telemetri[1]
+                self.data_payload["attitude"]["heading"] = self.telemetri[2]
 
         # Push to Firebase
         if self.fb_ref is not None:
             try:
-                self.fb_ref.set(self.data_payload)
+                with self._upload_lock:
+                    self.fb_ref.set(self.data_payload)
             except Exception as e:
                 self.get_logger().warn(f'Firebase write error: {e}')
 
     def destroy_node(self):
-        # CRITICAL FIX: Cleanup resources and clear sensitive data
+        # Cleanup resources and clear sensitive data
         try:
-            # Clear frame cache
             self.latest_frame = {'utama': None, 'bawah': None, 'samping': None}
         except Exception:
             pass
         try:
-            # Clear Firebase reference
             self.fb_ref = None
         except Exception:
             pass

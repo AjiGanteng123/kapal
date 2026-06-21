@@ -1,8 +1,8 @@
 /node_kamera:
   ros__parameters:
-    device_utama: 0
+    device_utama: ""
     device_bawah: ""
-    device_samping: ""
+    device_samping: "0"
     fps_utama: 30
     fps_bawah: 10
     fps_samping: 10
@@ -17,6 +17,10 @@
     required_frames: 5
     horizon_ratio: 0.33
     inference_interval_ms: 100
+    capture_conf_threshold: 0.8
+    capture_min_area: 2000
+    capture_blur_threshold: 100.0
+    capture_position_margin: 0.25
 
 /node_lidar:
   ros__parameters:
